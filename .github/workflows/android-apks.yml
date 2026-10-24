@@ -1,0 +1,119 @@
+name: Android APKs
+
+# Brand-new repo layout this file expects:
+#   sandors-mirrorcast-source.zip    <- the zip, at the repository root
+#   .github/workflows/android-apks.yml
+# The zip is unpacked at the root (SandorsSender/ and SandorsReceiver/
+# stay intact). The sender is built and uploaded, then the receiver.
+# Uploads are never in parallel, so GitHub does not 409 on artifacts.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "*.zip"
+      - ".github/workflows/android-apks.yml"
+  pull_request:
+    paths:
+      - "*.zip"
+      - ".github/workflows/android-apks.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apks:
+    name: Sender, then receiver
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Unpack the source zip
+        run: |
+          python3 - << 'PY'
+          import zipfile
+          from pathlib import Path
+          root = Path(".").resolve()
+          preferred = root / "sandors-mirrorcast-source.zip"
+          if preferred.is_file():
+              archive = preferred
+          else:
+              found = sorted(p for p in root.glob("*.zip") if p.is_file())
+              if len(found) != 1:
+                  names = ", ".join(p.name for p in found) or "(none)"
+                  raise SystemExit(
+                      "Upload sandors-mirrorcast-source.zip to the repository root, "
+                      f"next to .github. Found: {names}"
+                  )
+              archive = found[0]
+          print(f"using {archive.name}")
+          with zipfile.ZipFile(archive) as zf:
+              for info in zf.infolist():
+                  name = info.filename
+                  if name.startswith("/") or ".." in Path(name).parts:
+                      raise SystemExit(f"refusing unsafe path {name}")
+              zf.extractall(root)
+          sender = root / "SandorsSender" / "gradlew"
+          receiver = root / "SandorsReceiver" / "gradlew"
+          if not sender.is_file() or not receiver.is_file():
+              raise SystemExit("zip did not unpack SandorsSender and SandorsReceiver at the repo root")
+          print("unpacked", sender.name, "and", receiver.name)
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install SDK platforms
+        run: |
+          sdkmanager --install \
+            "platforms;android-35" \
+            "platforms;android-34" \
+            "build-tools;35.0.0" \
+            "build-tools;34.0.0"
+
+      - name: Build Sandors Sender
+        working-directory: SandorsSender
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --stacktrace --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/sandors-sender-debug.apk"
+
+      - name: Upload sender APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandors-sender
+          path: sandors-sender-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build Sandors Receiver
+        working-directory: SandorsReceiver
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --stacktrace --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/sandors-receiver-debug.apk"
+
+      - name: Upload receiver APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandors-receiver
+          path: sandors-receiver-debug.apk
+          if-no-files-found: error
+          retention-days: 14
