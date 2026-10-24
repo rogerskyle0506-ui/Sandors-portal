@@ -6,7 +6,7 @@ on:
       zip_filename:
         description: 'Name of the zip file to extract (must be in the root directory)'
         required: true
-        default: 'archive.zip'
+        default: 'grok-workspace.zip'
 
 jobs:
   unzip:
