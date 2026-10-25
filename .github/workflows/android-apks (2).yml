@@ -1,0 +1,172 @@
+name: Android APKs
+
+# This repo has grok-workspace.zip at the root. That zip keeps the apps at
+# android/SandorsSender and android/SandorsReceiver, not at the zip root.
+# Unpack it, find those projects, build the sender and upload it, then build
+# the receiver and upload that. Uploads stay one at a time so GitHub does
+# not 409.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "*.zip"
+      - ".github/workflows/android-apks.yml"
+  pull_request:
+    paths:
+      - "*.zip"
+      - ".github/workflows/android-apks.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apks:
+    name: Sender, then receiver
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Unpack the source zip
+        run: |
+          python3 - << 'PY'
+          import zipfile
+          from pathlib import Path
+          root = Path(".").resolve()
+          named = [root / "grok-workspace.zip", root / "sandors-mirrorcast-source.zip"]
+          archive = next((p for p in named if p.is_file()), None)
+          if archive is None:
+              found = sorted(p for p in root.glob("*.zip") if p.is_file())
+              if len(found) != 1:
+                  names = ", ".join(p.name for p in found) or "(none)"
+                  raise SystemExit(f"Put grok-workspace.zip at the repository root. Found: {names}")
+              archive = found[0]
+          print(f"using {archive.name}")
+          with zipfile.ZipFile(archive) as zf:
+              for info in zf.infolist():
+                  name = info.filename
+                  if name.startswith("/") or ".." in Path(name).parts:
+                      raise SystemExit(f"refusing unsafe path {name}")
+              zf.extractall(root)
+
+          def find_project(folder: str) -> Path:
+              matches = []
+              for gradlew in root.rglob("gradlew"):
+                  project = gradlew.parent
+                  if project.name != folder or not gradlew.is_file():
+                      continue
+                  parts = set(project.parts)
+                  if "node_modules" in parts or ".vercel" in parts:
+                      continue
+                  matches.append(project)
+              if not matches:
+                  raise SystemExit(f"unpacked {archive.name} but did not find {folder}/gradlew")
+              def rank(path: Path):
+                  penalty = 0
+                  if "public" in path.parts:
+                      penalty += 10
+                  if path.parent.name == "android":
+                      penalty -= 5
+                  return (penalty, len(path.parts), str(path))
+              return sorted(matches, key=rank)[0]
+
+          sender = find_project("SandorsSender")
+          receiver = find_project("SandorsReceiver")
+          sender_rel = sender.relative_to(root).as_posix()
+          receiver_rel = receiver.relative_to(root).as_posix()
+          print(f"sender={sender_rel}")
+          print(f"receiver={receiver_rel}")
+          import os
+          env_path = Path(os.environ["GITHUB_ENV"])
+          with env_path.open("a", encoding="utf-8") as handle:
+              handle.write(f"SENDER_DIR={sender_rel}\n")
+              handle.write(f"RECEIVER_DIR={receiver_rel}\n")
+          PY
+
+      - name: Make SDK 35 and the media classes compile
+        run: |
+          python3 - << 'PY'
+          import os
+          from pathlib import Path
+          root = Path(".").resolve()
+          sender = root / os.environ["SENDER_DIR"]
+          receiver = root / os.environ["RECEIVER_DIR"]
+          # AGP 8.5.2 was only tested through compileSdk 34. 8.6.1 matches the
+          # Gradle 8.7 wrapper already in the zip and accepts compileSdk 35.
+          for project in (sender, receiver):
+              gradle = project / "build.gradle"
+              gradle.write_text(gradle.read_text().replace('version "8.5.2"', 'version "8.6.1"'))
+              props = project / "gradle.properties"
+              text = props.read_text() if props.exists() else ""
+              if "suppressUnsupportedCompileSdk" not in text:
+                  if text and not text.endswith("\n"):
+                      text += "\n"
+                  text += "android.suppressUnsupportedCompileSdk=35\n"
+                  props.write_text(text)
+          service = sender / "app/src/main/java/com/sandors/mirrorcast/sender/cast/CastForegroundService.kt"
+          source = service.read_text()
+          source = source.replace(
+              "import android.support.v4.media.VolumeProviderCompat",
+              "import androidx.media.VolumeProviderCompat",
+          )
+          service.write_text(source)
+          print("AGP 8.6.1 and VolumeProviderCompat are ready")
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install SDK platforms
+        run: |
+          sdkmanager --install \
+            "platforms;android-35" \
+            "platforms;android-34" \
+            "build-tools;35.0.0" \
+            "build-tools;34.0.0"
+
+      - name: Build Sandors Sender
+        run: |
+          cd "$SENDER_DIR"
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --stacktrace --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/sandors-sender-debug.apk"
+
+      - name: Upload sender APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandors-sender
+          path: sandors-sender-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build Sandors Receiver
+        run: |
+          cd "$RECEIVER_DIR"
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --stacktrace --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/sandors-receiver-debug.apk"
+
+      - name: Upload receiver APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandors-receiver
+          path: sandors-receiver-debug.apk
+          if-no-files-found: error
+          retention-days: 14
